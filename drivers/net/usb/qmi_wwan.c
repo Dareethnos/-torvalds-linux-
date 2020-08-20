@@ -61,6 +61,7 @@ enum qmi_wwan_flags {
 
 enum qmi_wwan_quirks {
 	QMI_WWAN_QUIRK_DTR = 1 << 0,	/* needs "set DTR" request */
+	QMI_WWAN_QUIRK_QUECTEL_DYNCFG = 1 << 1,	/* check num. endpoints */
 };
 
 struct qmimux_hdr {
@@ -521,6 +522,24 @@ static const u8 default_modem_addr[ETH_ALEN] = {0x02, 0x50, 0xf3};
 
 static const u8 buggy_fw_addr[ETH_ALEN] = {0x00, 0xa0, 0xc6, 0x00, 0x00, 0x00};
 
+#include <linux/etherdevice.h>
+/* fixup tx packet (add framing) */
+static struct sk_buff *qmi_wwan_tx_fixup(struct usbnet *dev, struct sk_buff *skb, gfp_t flags)
+{
+	if (dev->udev->descriptor.idVendor != cpu_to_le16(0x2c7c))
+		return skb;
+
+	//Skip ethernet header from message
+	if (skb_pull(skb, ETH_HLEN))
+		return skb;
+
+	dev_err(&dev->intf->dev, "Packet Dropped");
+
+	// Filter the packet out, release it
+	dev_kfree_skb_any(skb);
+	return NULL;
+}
+
 /* Make up an ethernet header if the packet doesn't have one.
  *
  * A firmware bug common among several devices cause them to send raw
@@ -719,7 +738,7 @@ static int qmi_wwan_change_dtr(struct usbnet *dev, bool on)
 
 static int qmi_wwan_bind(struct usbnet *dev, struct usb_interface *intf)
 {
-	int status;
+	int status = -1;
 	u8 *buf = intf->cur_altsetting->extra;
 	int len = intf->cur_altsetting->extralen;
 	struct usb_interface_descriptor *desc = &intf->cur_altsetting->desc;
@@ -815,6 +834,20 @@ static int qmi_wwan_bind(struct usbnet *dev, struct usb_interface *intf)
 	}
 	dev->net->netdev_ops = &qmi_wwan_netdev_ops;
 	dev->net->sysfs_groups[0] = &qmi_wwan_sysfs_attr_group;
+
+	if (dev->udev->descriptor.idVendor == cpu_to_le16(0x2c7c)) {
+		dev_info(&intf->dev, "Quectel EC25&EC21&EG91&EG95&EG06&IP06&EM06&BG96&AG35 work on RawIP mode\n");
+		dev->net->flags |= IFF_NOARP;
+		// Kernel version > 3.9.1
+		usb_control_msg(interface_to_usbdev(intf),
+				usb_sndctrlpipe(interface_to_usbdev(intf), 0),
+				0x22, //USB_CDC_REQ_SET_CONTROL_LINE_STATE
+				0x21, //USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE
+				1, //active CDC DTR
+				intf->cur_altsetting->desc.bInterfaceNumber,
+				NULL, 0, 100);
+	}
+
 err:
 	return status;
 }
@@ -906,6 +939,7 @@ static const struct driver_info	qmi_wwan_info = {
 	.unbind		= qmi_wwan_unbind,
 	.manage_power	= qmi_wwan_manage_power,
 	.rx_fixup       = qmi_wwan_rx_fixup,
+	.tx_fixup       = qmi_wwan_tx_fixup,
 };
 
 static const struct driver_info	qmi_wwan_info_quirk_dtr = {
@@ -916,6 +950,16 @@ static const struct driver_info	qmi_wwan_info_quirk_dtr = {
 	.manage_power	= qmi_wwan_manage_power,
 	.rx_fixup       = qmi_wwan_rx_fixup,
 	.data           = QMI_WWAN_QUIRK_DTR,
+};
+
+static const struct driver_info	qmi_wwan_info_quirk_quectel_dyncfg = {
+	.description	= "WWAN/QMI device",
+	.flags		= FLAG_WWAN | FLAG_SEND_ZLP,
+	.bind		= qmi_wwan_bind,
+	.unbind		= qmi_wwan_unbind,
+	.manage_power	= qmi_wwan_manage_power,
+	.rx_fixup       = qmi_wwan_rx_fixup,
+	.data           = QMI_WWAN_QUIRK_DTR | QMI_WWAN_QUIRK_QUECTEL_DYNCFG,
 };
 
 #define HUAWEI_VENDOR_ID	0x12D1
@@ -1058,6 +1102,7 @@ static const struct usb_device_id products[] = {
 	{QMI_MATCH_FF_FF_FF(0x2c7c, 0x0125)},	/* Quectel EC25, EC20 R2.0  Mini PCIe */
 	{QMI_MATCH_FF_FF_FF(0x2c7c, 0x0306)},	/* Quectel EP06/EG06/EM06 */
 	{QMI_MATCH_FF_FF_FF(0x2c7c, 0x0512)},	/* Quectel EG12/EM12 */
+	{QMI_MATCH_FF_FF_FF(0x2c7c, 0x0195)},	/* Quectel EG95 */
 	{QMI_MATCH_FF_FF_FF(0x2c7c, 0x0800)},	/* Quectel RM500Q-GL */
 
 	/* 3. Combined interface devices matching on interface number */
